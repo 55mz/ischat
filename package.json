@@ -16,6 +16,7 @@
     "react-dom": "^19.2.6",
     "tailwind-merge": "^3.6.0",
     "uuid": "^14.0.0",
+    "vectra": "^0.15.0",
     "zustand": "^5.0.13"
   },
   "devDependencies": {

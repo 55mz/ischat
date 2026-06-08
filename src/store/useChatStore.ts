@@ -1,5 +1,14 @@
 import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
+import { memoryStore } from '../services/memoryStore';
+
+export interface AttachedFile {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  content?: string;
+}
 
 export interface Message {
   id: string;
@@ -8,6 +17,7 @@ export interface Message {
   status: 'pending' | 'streaming' | 'completed' | 'error';
   agentId?: string;
   createdAt: number;
+  files?: AttachedFile[];
 }
 
 export interface ChatState {
@@ -15,15 +25,19 @@ export interface ChatState {
   currentConversationId: string;
   isStreaming: boolean;
   abortController: AbortController | null;
-  
+
   setConversation: (id: string) => void;
-  sendMessage: (content: string, agentId: string) => Promise<void>;
+  sendMessage: (content: string, agentId: string, files?: AttachedFile[]) => Promise<void>;
   stopStreaming: () => void;
   addMessage: (conversationId: string, message: Message) => void;
   updateMessage: (conversationId: string, messageId: string, updates: Partial<Message>) => void;
+  getContext: (conversationId: string) => {
+    systemPrompt: string;
+    shortTermMessages: { role: 'user' | 'assistant'; content: string }[];
+  };
+  saveMessagePair: (conversationId: string, userMsg: { content: string; id: string }, assistantMsg: { content: string; id: string }) => Promise<void>;
 }
 
-// 解析 SSE 流数据
 const parseSSELine = (line: string) => {
   if (line.startsWith('data: ')) {
     const data = line.slice(6);
@@ -85,11 +99,52 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ isStreaming: false, abortController: null });
   },
 
-  sendMessage: async (content, agentId) => {
+  getContext: (conversationId) => {
+    const memory = memoryStore.getContext(conversationId);
+    let systemPrompt = 'You are a helpful assistant. When users upload files, analyze the file content and provide insights based on the actual content of the files.';
+    if (memory.longTermSummary) {
+      systemPrompt += `\n\n---\n\nPrevious conversation summary:\n${memory.longTermSummary}`;
+    }
+    return {
+      systemPrompt,
+      shortTermMessages: memory.shortTermMessages,
+    };
+  },
+
+  saveMessagePair: async (conversationId, userMsg, assistantMsg) => {
+    const { shouldGenerateSummary, memory } = memoryStore.addMessagePair(
+      conversationId,
+      userMsg,
+      assistantMsg
+    );
+
+    if (shouldGenerateSummary) {
+      try {
+        const oldMessages = memoryStore.getOldestRoundsForSummary(conversationId, 5);
+        const conversationText = oldMessages
+          .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+          .join('\n\n');
+
+        const response = await fetch('/api/summarize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ conversation: conversationText }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          memoryStore.updateSummary(conversationId, data.summary, memory.currentRound);
+        }
+      } catch (error) {
+        console.error('Failed to generate summary:', error);
+      }
+    }
+  },
+
+  sendMessage: async (content, agentId, files = []) => {
     const { currentConversationId, isStreaming, abortController } = get();
     if (isStreaming) return;
 
-    // 如果有正在进行的请求，先取消它
     if (abortController) {
       abortController.abort();
     }
@@ -98,13 +153,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const userMessageId = uuidv4();
     const assistantMessageId = uuidv4();
 
-    // 1. 乐观更新用户消息
     const userMessage: Message = {
       id: userMessageId,
       role: 'user',
       content: content.trim(),
       status: 'completed',
       createdAt: Date.now(),
+      files: files.length > 0 ? files.map(f => ({ id: f.id, name: f.name, size: f.size, type: f.type })) : undefined,
     };
 
     const assistantMessage: Message = {
@@ -130,13 +185,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     try {
-      // 2. 发送请求并处理流式响应
+      const { systemPrompt, shortTermMessages } = get().getContext(currentConversationId);
+
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...shortTermMessages,
+        { role: 'user', content: content },
+      ];
+
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: content, 
-          conversationId: currentConversationId 
+        body: JSON.stringify({
+          message: content,
+          conversationId: currentConversationId,
+          files: files.map(f => ({ name: f.name, type: f.type, content: f.content })),
+          context: shortTermMessages,
         }),
         signal: newAbortController.signal,
       });
@@ -148,7 +212,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
 
-      // 更新状态为 streaming
       get().updateMessage(currentConversationId, assistantMessageId, { status: 'streaming' });
 
       let buffer = '';
@@ -168,32 +231,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
             const delta = data.choices[0].delta;
             if (delta && delta.content) {
               fullContent += delta.content;
-              get().updateMessage(currentConversationId, assistantMessageId, { 
-                content: fullContent 
+              get().updateMessage(currentConversationId, assistantMessageId, {
+                content: fullContent
               });
             }
           }
         }
       }
 
-      // 3. 完成流
-      get().updateMessage(currentConversationId, assistantMessageId, { 
+      get().updateMessage(currentConversationId, assistantMessageId, {
         status: 'completed',
         content: fullContent,
       });
 
+      await get().saveMessagePair(
+        currentConversationId,
+        { id: userMessageId, content: content },
+        { id: assistantMessageId, content: fullContent }
+      );
+
     } catch (error) {
-      if (error.name === 'AbortError') {
-        // 用户手动停止
+      if (error instanceof Error && error.name === 'AbortError') {
         const lastMsg = get().messages[currentConversationId]?.slice(-1)[0];
         if (lastMsg && lastMsg.status === 'streaming') {
           get().updateMessage(currentConversationId, lastMsg.id, { status: 'completed' });
         }
       } else {
         console.error('Error in sendMessage:', error);
-        get().updateMessage(currentConversationId, assistantMessageId, { 
+        get().updateMessage(currentConversationId, assistantMessageId, {
           content: 'Sorry, something went wrong. Please try again.',
-          status: 'error' 
+          status: 'error'
         });
       }
     } finally {
@@ -201,3 +268,4 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   }
 }));
+

@@ -1,4 +1,4 @@
-import { Send, User, Bot, Paperclip, Smile } from 'lucide-react'
+import { Bot } from 'lucide-react'
 import { useChatStore } from '../store/useChatStore'
 import MessageItem from './MessageItem'
 import ChatInput from './ChatInput'

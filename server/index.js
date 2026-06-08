@@ -15,11 +15,78 @@ app.use((req, res, next) => {
   next()
 })
 
+// 摘要生成接口
+app.post('/api/summarize', async (req, res) => {
+  try {
+    const { conversation } = req.body
+    console.log('收到摘要生成请求，对话长度:', conversation.length)
+    
+    const API_KEY = process.env.DEEPSEEK_API_KEY
+    
+    if (!API_KEY) {
+      return res.status(500).json({ error: 'DEEPSEEK_API_KEY is not set' })
+    }
+    
+    console.log('正在调用 DeepSeek 生成摘要...')
+
+    const prompt = `You are a memory summarizer. Your task is to summarize the conversation history concisely.
+
+Rules:
+1. Keep key information: names, preferences, important facts, questions asked, answers given
+2. Keep it concise (max 200 words)
+3. Maintain chronological order
+4. Use bullet points for clarity
+5. Focus on what the user said and what was agreed upon
+
+Conversation to summarize:
+${conversation}
+
+Summary:`
+
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: prompt }],
+        stream: false,
+        temperature: 0.3,
+      }),
+    })
+
+    console.log('DeepSeek 摘要 API 响应状态:', response.status)
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      console.error('DeepSeek 摘要 API 错误:', response.status, errorText)
+      return res.status(500).json({ 
+        error: `DeepSeek summarize error: ${response.status}`, 
+        details: errorText 
+      })
+    }
+
+    const data = await response.json()
+    const summary = data.choices[0].message.content
+    
+    res.json({ summary })
+    console.log('摘要生成完成，长度:', summary.length)
+
+  } catch (error) {
+    console.error('摘要服务器错误:', error)
+    res.status(500).json({ error: 'Internal server error', details: error.message })
+  }
+})
+
 // 简单的 DeepSeek 流式代理
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, conversationId } = req.body
+    const { message, conversationId, files = [], context = [] } = req.body
     console.log('收到请求，message:', message)
+    console.log('文件数量:', files.length)
+    console.log('上下文消息数量:', context.length)
     
     // 从环境变量读取 API Key
     const API_KEY = process.env.DEEPSEEK_API_KEY
@@ -30,6 +97,38 @@ app.post('/api/chat', async (req, res) => {
     }
     
     console.log('正在调用 DeepSeek API...')
+
+    // 构建用户消息，包含文件内容
+    let userContent = message
+
+    if (files && files.length > 0) {
+      userContent += '\n\n[附件文件]:\n'
+      files.forEach((file, index) => {
+        userContent += `\n文件 ${index + 1}: ${file.name} (${file.type})\n`
+        // 对于文本文件，包含内容
+        if (file.type.startsWith('text/') || file.type === 'application/json' || file.name.endsWith('.md') || file.name.endsWith('.txt') || file.name.endsWith('.csv')) {
+          try {
+            // 解码 base64 内容
+            const buffer = Buffer.from(file.content, 'base64')
+            const textContent = buffer.toString('utf-8')
+            userContent += `\n内容:\n${textContent}\n`
+          } catch (e) {
+            userContent += `\n(无法读取文件内容)\n`
+          }
+        } else {
+          userContent += `\n(二进制文件，已上传但无法显示内容)\n`
+        }
+      })
+      userContent += '\n请基于以上文件内容回答用户的问题。'
+    }
+
+    // 构建完整消息列表
+    const messages = [
+      { role: 'system', content: 'You are a helpful assistant. When users upload files, analyze the file content and provide insights based on the actual content of the files.' },
+      ...context,
+      { role: 'user', content: userContent }
+    ]
+
     const response = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
       headers: {
@@ -38,10 +137,7 @@ app.post('/api/chat', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'deepseek-chat',
-        messages: [
-          { role: 'system', content: 'You are a helpful assistant.' },
-          { role: 'user', content: message }
-        ],
+        messages,
         stream: true,
       }),
     })
