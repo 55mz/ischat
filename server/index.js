@@ -80,23 +80,78 @@ Summary:`
   }
 })
 
+// Tavily 搜索接口
+app.post('/api/tavily-search', async (req, res) => {
+  try {
+    const { query, search_depth = 'basic', max_results = 5 } = req.body
+    console.log('收到 Tavily 搜索请求:', query)
+    
+    const TAVILY_API_KEY = process.env.TAVILY_API_KEY
+    
+    if (!TAVILY_API_KEY) {
+      return res.status(500).json({ error: 'TAVILY_API_KEY is not set' })
+    }
+    
+    console.log('正在调用 Tavily 搜索...')
+
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        api_key: TAVILY_API_KEY,
+        query,
+        search_depth,
+        max_results,
+        include_images: false,
+        include_answers: true
+      })
+    })
+
+    console.log('Tavily API 响应状态:', response.status)
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      console.error('Tavily API 错误:', response.status, errorText)
+      return res.status(500).json({ 
+        error: `Tavily search error: ${response.status}`, 
+        details: errorText 
+      })
+    }
+
+    const data = await response.json()
+    res.json(data)
+    console.log('Tavily 搜索完成，结果数:', data.results?.length || 0)
+
+  } catch (error) {
+    console.error('Tavily 搜索服务器错误:', error)
+    res.status(500).json({ error: 'Internal server error', details: error.message })
+  }
+})
+
 // 简单的 DeepSeek 流式代理
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, conversationId, files = [], context = [] } = req.body
-    console.log('收到请求，message:', message)
-    console.log('文件数量:', files.length)
-    console.log('上下文消息数量:', context.length)
+    console.log('📥 完整请求体:', JSON.stringify(req.body, null, 2).substring(0, 500))
+    const { message, conversationId, files = [], context = [], system_prompt = null } = req.body
+    console.log('📨 收到请求，message:', message)
+    console.log('📁 文件数量:', files.length)
+    console.log('📜 上下文消息数量:', context.length)
+    console.log('🎯 system_prompt 是否存在?', !!system_prompt)
+    if (system_prompt) {
+      console.log('🎯 收到自定义 system prompt，长度:', system_prompt.length)
+    }
     
     // 从环境变量读取 API Key
     const API_KEY = process.env.DEEPSEEK_API_KEY
-    console.log('API Key 长度:', API_KEY ? API_KEY.length : '未设置')
+    console.log('🔑 API Key 长度:', API_KEY ? API_KEY.length : '未设置')
     
     if (!API_KEY) {
       return res.status(500).json({ error: 'DEEPSEEK_API_KEY is not set' })
     }
     
-    console.log('正在调用 DeepSeek API...')
+    console.log('🚀 正在调用 DeepSeek API...')
 
     // 构建用户消息，包含文件内容
     let userContent = message
@@ -122,9 +177,13 @@ app.post('/api/chat', async (req, res) => {
       userContent += '\n请基于以上文件内容回答用户的问题。'
     }
 
-    // 构建完整消息列表
+    // 构建完整消息列表 - 如果有 system_prompt，优先使用
+    const systemMessage = system_prompt || 'You are a helpful assistant. When users upload files, analyze the file content and provide insights based on the actual content of the files.'
+    console.log('📋 最终发送给 LLM 的消息数量:', 2 + context.length)
+    console.log('🤖 System message 预览（前200字）:', systemMessage.substring(0, 200))
+    
     const messages = [
-      { role: 'system', content: 'You are a helpful assistant. When users upload files, analyze the file content and provide insights based on the actual content of the files.' },
+      { role: 'system', content: systemMessage },
       ...context,
       { role: 'user', content: userContent }
     ]

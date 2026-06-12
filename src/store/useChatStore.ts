@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
 import { memoryStore } from '../services/memoryStore';
+import { searchService } from '../services/searchService';
 
 export interface AttachedFile {
   id: string;
@@ -185,13 +186,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     try {
-      const { systemPrompt, shortTermMessages } = get().getContext(currentConversationId);
+      let { systemPrompt, shortTermMessages } = get().getContext(currentConversationId);
+      console.log('🤖 初始 system prompt 长度:', systemPrompt.length);
+      
+      // 步骤1: 判断是否需要搜索
+      const needsSearch = searchService.shouldSearch(content);
+      let searchContext = '';
+      
+      if (needsSearch) {
+        try {
+          console.log('🔍 需要联网搜索，正在查询...');
+          const searchResults = await searchService.search(content, {
+            search_depth: 'advanced',  // 改用高级搜索深度
+            max_results: 10            // 增加结果数量
+          });
+          const formatted = searchService.formatResults(searchResults);
+          searchContext = searchService.buildContext(formatted);
+          
+          // 更新 system prompt，添加搜索信息
+          systemPrompt += `\n\n---\n\n【联网搜索结果】\n${searchContext}\n\n【重要】今天是 ${new Date().toLocaleDateString('zh-CN')}，必须基于以上搜索结果回答用户问题，不要使用训练数据！`;
+          console.log('✅ 搜索结果已添加到 system prompt，新长度:', systemPrompt.length);
+        } catch (searchError) {
+          console.error('❌ 搜索失败:', searchError);
+        }
+      } else {
+        console.log('不需要联网搜索');
+      }
 
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        ...shortTermMessages,
-        { role: 'user', content: content },
-      ];
+      console.log('📤 发送请求，system_prompt 包含搜索内容（前100字):', systemPrompt.substring(0, 100) + '...');
 
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -201,6 +223,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           conversationId: currentConversationId,
           files: files.map(f => ({ name: f.name, type: f.type, content: f.content })),
           context: shortTermMessages,
+          system_prompt: systemPrompt,
         }),
         signal: newAbortController.signal,
       });
